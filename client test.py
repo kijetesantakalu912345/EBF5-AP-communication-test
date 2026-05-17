@@ -1,10 +1,17 @@
-import socket
-from basic_socket import *
+from basic_socket import BasicSocket
 
-client = BasicSocket()
-client.connect("localhost", 4999)
-client.sendUTF8("4 byte length and then UTF-8 text string packet send from the client.")
-serverMessage = client.receiveUTF8()
-print(f"server reply: \"{serverMessage}\"")
-# client.sock.shutdown(socket.SHUT_WR)
-client.sock.close()
+HOST = "localhost"
+PORT = 4999
+
+
+def client_test():
+    client = BasicSocket()
+    client.connect(HOST, PORT)
+    client.send_utf8("4 byte length and then UTF-8 text string packet send from the client.")
+    server_message = client.receive_utf8()
+    print(f'server reply: "{server_message}"')
+    client.close()
+
+
+if __name__ == "__main__":
+    client_test()
