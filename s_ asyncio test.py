@@ -37,9 +37,10 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
         
         self.client_sock: None | Socket = None
 
+        self.message_bytes_to_send = bytearray()
         self.received_message_fragments = bytearray()
         self.incoming_message_final_length: int = 0
-        self.message_bytes_to_send = bytearray()
+        self.is_waiting_for_new_message: bool = True
 
         if timeout >= 0:
             self.server_sock.settimeout(timeout)
@@ -57,41 +58,42 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
         self.message_bytes_to_send += message_bytes
 
     def client_readwrite_callback(self, client: Socket, mask):
-        # TODO: handle receiving 0 bytes (ie, a disconnect)
         if mask & selectors.EVENT_READ:
             log("reading...")
-            if len(self.received_message_fragments) < 4: # ADD self.isWaitingForNewMessage!!!!!
-                new_bytes = client.recv(4 - len(self.received_message_fragments))
 
-                # TODO: probably move into a function, replace with just closing the client socket and keeping the rest of the class alive.
-                # also fix in the other copy of this code obviously.
-                self.received_message_fragments += new_bytes
-                if len(new_bytes) == 0:
-                    self.close()
-                    raise SocketConnectionBrokenError
-                
-                
-                if len(self.received_message_fragments) >= 4: # could get away with == but >= is safer
-                    self.incoming_message_final_length = int.from_bytes(self.received_message_fragments[:4], "big", signed=False)
-                    if len(self.received_message_fragments) > 4:
-                        log("somehow reached `len(self.received_message_fragments) > 4` while receiving message length.")
-            # TODO/TO THINK ABOUT LATER: we could select again here because there were probably more than just 4 (or less) bytes sent.
-            else:
-                new_bytes = client.recv(self.incoming_message_final_length - len(self.received_message_fragments))
-                self.received_message_fragments += new_bytes
-                if len(new_bytes) == 0:
-                    self.close()
-                    raise SocketConnectionBrokenError
-                if len(self.received_message_fragments) >= self.incoming_message_final_length: # again == is more correct but >= is safer
-                    log("message fully received!")
-                    if len(self.received_message_fragments) > self.incoming_message_final_length:
-                        log("len(self.received_message_fragments) > self.incoming_message_final_length.")
-                    message_text: str = self.received_message_fragments[4:4 + self.incoming_message_final_length].decode("utf-8")
-                    self.on_message_received(message_text)
+            new_bytes = client.recv(2 ** 16)
+            self.received_message_fragments += new_bytes
+            done_reading = False
 
-                    #self.received_message_fragments.clear()
-                    self.received_message_fragments = self.received_message_fragments[4 + self.incoming_message_final_length:]
-                    self.incoming_message_final_length = 0
+            if len(new_bytes) == 0:
+                self.close()
+                raise SocketConnectionBrokenError
+
+            while not done_reading:
+                log(f"start: {self.received_message_fragments}")
+                if self.is_waiting_for_new_message:
+                    if len(self.received_message_fragments) >= 4:
+                        self.incoming_message_final_length = int.from_bytes(self.received_message_fragments[:4], "big", signed=False)
+                        self.is_waiting_for_new_message = False
+                    else:
+                        done_reading = True
+
+                if not self.is_waiting_for_new_message:
+                    if len(self.received_message_fragments) >= self.incoming_message_final_length:
+                        log("message fully received!")
+                        if len(self.received_message_fragments) > self.incoming_message_final_length:
+                            log("len(self.received_message_fragments) > self.incoming_message_final_length.")
+                        message_text: str = self.received_message_fragments[4:4 + self.incoming_message_final_length].decode("utf-8")
+                        self.on_message_received(message_text)
+
+                        #self.received_message_fragments.clear()
+                        self.received_message_fragments = self.received_message_fragments[4 + self.incoming_message_final_length:]
+                        self.incoming_message_final_length = 0
+                        self.is_waiting_for_new_message = True
+                    else:
+                        done_reading = True
+            
+                log(f"loop/end: {self.received_message_fragments}")
 
         if mask & selectors.EVENT_WRITE:
             if len(self.message_bytes_to_send) > 0:
@@ -158,16 +160,6 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
     # with the newest version of AP now merged our _cmd fucntions could be async.
     # so we don't absolutely have to use a sync function. probably easier to just not.
     def syncronous_function_we_need_to_send_messages_from(self):
-        # probably have this function get called on loop from within a `Task`
-
-        # uhhhhhhhhhhhhhhhhhhhh ok wait how am I gonna get replies in this function after I send a message to the client?
-        # hm...
-        # like I probably want some mechanism for being able to easily wait for a client reply and continue from there.
-        # maybe like, a queue of coros or something that goes along with a queue of unprocessed fully reconstructed incoming messages?
-        # ehhhhhh maybe?
-        # actually wait i can just go look at how AP solves this problem.
-        # hm.
-        # maybe it's just because it's like 11:30 PM but honestly I think it just kinda does stuff indirectly.
-        # anyway yeah I'll probably want to figure out some kind of `await send_message_and_wait_for_response()` system for functions like this.
-        # IDK I'll have to think it through more in the morning
+        # Probably have this function get called on loop from within a `Task`
+        # We'll just handle replies in the on_message_received() function.
         pass
