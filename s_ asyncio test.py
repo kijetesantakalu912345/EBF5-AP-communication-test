@@ -1,7 +1,9 @@
 import asyncio
-from socket import socket as Socket, AF_INET, SOCK_STREAM, SHUT_RDWR
+from socket import socket as Socket, AF_INET, SOCK_STREAM, SHUT_RDWR, SOL_SOCKET, SO_REUSEADDR
 import selectors
 from datetime import datetime
+import json
+from inspect import iscoroutinefunction
 
 HOST = "localhost"
 PORT = 4999
@@ -22,17 +24,21 @@ def log(message: str):
 
 # https://docs.python.org/3/library/selectors.html#examples
 class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
-    def __init__(self, host: str, port: int, timeout: float = -1):
+    def __init__(self, host: str, port: int, timeouts_seconds: float = 30):
         # Supporting IPV6 would probably be nice.
         # But it'll probably just be running on localhost or a local network with IPV4 LAN addresses anyway.
         self.server_sock: Socket = Socket(AF_INET, SOCK_STREAM)
+        
+        # FIXME: this should probably be removed when we aren't just debug testing stuff.
+        self.server_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+
         self.server_sock.bind((host, port))
         self.server_sock.listen(1) # CHECK THIS
         self.server_sock.setblocking(False)
 
         self.select_task: asyncio.Task | None = None
-        # self.sync_message_sending_task: asyncio.Task | None = None
         self.other_work_task: asyncio.Task | None = None
+        self.wait_for_empty_buffers_to_close_client_socket_task: asyncio.Task | None = None
         self.exit_event: asyncio.Event = asyncio.Event()
         
         self.selector = selectors.DefaultSelector()
@@ -45,26 +51,47 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
         self.incoming_message_final_length: int = 0
         self.is_waiting_for_new_message: bool = True
 
-        if timeout >= 0:
-            self.server_sock.settimeout(timeout)
+        self.disconnect_scheduled = False
 
-    def add_UTF8_message_to_send_queue(self, UTF8_message: str):
-        log(f"sending: {UTF8_message}")
-        length_bytes = len(UTF8_message).to_bytes(4, "big", signed=False)
+        # No this isn't grammatically incorrect, I'm talking about *all* of our socket related timeouts, in seconds, all using this same singular value.
+        self.timeouts_seconds = timeouts_seconds
+
+        if timeouts_seconds >= 0:
+            self.server_sock.settimeout(self.timeouts_seconds)
+
+    def does_client_socket_exist(self) -> bool:
+        return isinstance(self.client_sock, Socket) and self.client_sock.fileno() != -1
+
+    def add_UTF8_message_to_send_queue(self, UTF8_message: str) -> bool:
+        """Add a message to the internal message send queue, to be sent later by the select loop.\n
+        ## Note: messages will not be added to the queue if `self.disconnect_scheduled` is `True`!\n
+        Messages also will not be added to the queue if the client socket doesn't exist.
+        
+        :return: Whether the message was added to the internal message send queue or not.
+        """
+        if self.disconnect_scheduled or not self.does_client_socket_exist():
+            log(f"**NOT** adding to send queue: {UTF8_message}, socket is closing or doesn't exist")
+            return False
+
+        log(f"adding to send queue: {UTF8_message}")
+        length_bytes = len(UTF8_message).to_bytes(4, "big", signed=False) # WAIT THIS WOULDN'T HANDLE UNICODE PROPERLY
         message_bytes = UTF8_message.encode("utf-8")
         self.message_bytes_to_send += length_bytes
         self.message_bytes_to_send += message_bytes
+        return True
 
     def accept_connection_callback(self, sock: Socket, mask):
-        if self.client_sock is Socket and self.client_sock.fileno() != -1:
+        if self.does_client_socket_exist():
             log("client attempted to connect before the previous client socket connection was broken, ignoring.")
             return
+        self.disconnect_scheduled = False
         self.client_sock, address = sock.accept()
         log(f"accepting connection from {address}")
         self.client_sock.setblocking(False)
         self.selector.register(self.client_sock, selectors.EVENT_READ | selectors.EVENT_WRITE, data=self.client_readwrite_callback)
 
-    def client_readwrite_callback(self, client: Socket, mask):
+    async def client_readwrite_callback(self, client: Socket, mask):
+        #log(f"mask: {mask} | read: {mask & selectors.EVENT_READ} | write: {mask & selectors.EVENT_WRITE} | read: {selectors.EVENT_READ} | write: {selectors.EVENT_WRITE}")
         if mask & selectors.EVENT_READ:
             log("reading...")
 
@@ -73,35 +100,37 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
             done_reading = False
 
             if len(new_bytes) == 0:
-                self.disconnect_client()
+                log("DISCONNECT RECEIVED!")
+                self._disconnect_client()
                 raise SocketConnectionBrokenError
-
+            
+            #log(f"start: {self.received_message_bytes}")
+            #log(f"len(new_bytes): {len(new_bytes)}")
             while not done_reading:
-                log(f"start: {self.received_message_bytes}")
                 if self.is_waiting_for_new_message:
                     if len(self.received_message_bytes) >= 4:
                         self.incoming_message_final_length = int.from_bytes(self.received_message_bytes[:4], "big", signed=False)
                         self.is_waiting_for_new_message = False
-                    else:
-                        done_reading = True
+                    #else:
+                    #    print("setting done reading")
+                    #    done_reading = True
 
                 if not self.is_waiting_for_new_message:
                     if len(self.received_message_bytes) >= self.incoming_message_final_length:
-                        log("message fully received!")
-                        if len(self.received_message_bytes) > self.incoming_message_final_length:
-                            log("len(self.received_message_fragments) > self.incoming_message_final_length.")
                         message_text: str = self.received_message_bytes[4:4 + self.incoming_message_final_length].decode("utf-8")
                         self.on_message_received(message_text)
 
-                        #self.received_message_fragments.clear()
+                        #self.received_message_bytes.clear()
                         self.received_message_bytes = self.received_message_bytes[4 + self.incoming_message_final_length:]
                         self.incoming_message_final_length = 0
                         self.is_waiting_for_new_message = True
-                    else:
-                        done_reading = True
+                
+                #await asyncio.sleep(0)
+                
+                # doing it here saves an extra loop.
+                if self.is_waiting_for_new_message and len(self.received_message_bytes) < 4:
+                    done_reading = True
             
-                log(f"loop/end: {self.received_message_bytes}")
-
         if mask & selectors.EVENT_WRITE:
             if len(self.message_bytes_to_send) > 0:
                 log("writing...")
@@ -113,18 +142,60 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
                 log("socket is writable but we have nothing to send right now.")
 
     def on_message_received(self, message: str):
-        log(f"received message: {message}")
-        reply = "message received successfully from a sync callback called from an asyncio `Task` polling the socket with `select()`!"
-        self.add_UTF8_message_to_send_queue(reply)
-        self.disconnect_client()
+        log(f"received message: \"{message}\"")
+        reply = "message received successfully in a callback called from an asyncio `Task` polling the socket with `select()`!"
+        self.add_UTF8_message_to_send_queue(json.dumps({"type":"client_to_game_debug_message", "text":reply}))
+        #self.__close()
+        self.schedule_client_disconnect()
 
-    def disconnect_client(self):
+    def schedule_client_disconnect(self):
+        log("Client disconnect is being scheduled.")
+        # Special raw UTF-8 non-JSON message, because we want `APSocket` to handle this on the game's end instead of `ItemHandler`.
+        self.add_UTF8_message_to_send_queue("client_disconnect_soon")
+        self.disconnect_scheduled = True
+
+        self.wait_for_empty_buffers_to_close_client_socket_task = asyncio.create_task(
+                self.wait_for_empty_buffers_to_close_client_socket(),
+                name="EBF5AP waiting for client socket buffers to empty before closing"
+        )
+
+    async def wait_for_empty_buffers_to_close_client_socket(self):
+        max_wait_seconds = self.timeouts_seconds
+        wait_seconds_per_wait = 1/30 # 1 EBF5 frame
+        waited_seconds = 0
+        
+        while self.does_client_socket_exist() and (len(self.message_bytes_to_send) > 0 or len(self.received_message_bytes) > 0):
+            await asyncio.sleep(wait_seconds_per_wait)
+            waited_seconds += wait_seconds_per_wait
+            if waited_seconds > max_wait_seconds:
+                log(f"WARNING: A client socket disconnect was scheduled but the buffers didn't clear after waiting a timeout of {max_wait_seconds}, " +
+                    "so we're force closing the socket right now anyway.")
+                log(f"len(self.message_bytes_to_send): {len(self.message_bytes_to_send)} | len(self.received_message_bytes): {len(self.received_message_bytes)}")
+                log("(there should be nothing to send but there probably is something to read if the game is sending too many messages to us)")
+                break
+        
+        log("Client socket will be disconnected now and buffers will be cleared.")
+        self.message_bytes_to_send.clear()
+        self.received_message_bytes.clear()
+        self.incoming_message_final_length = 0
+        if self.does_client_socket_exist():
+            self._disconnect_client()
+        else:
+            log("Client socket disconnected early or the client socket was closed/didn't exist already.")
+            # should I try to unregister if we can here?
+
+
+    def _disconnect_client(self):
         log("closing client...")
-        if self.client_sock is not None or (self.client_sock is Socket and self.client_sock.fileno() != -1):
+        if isinstance(self.client_sock, Socket):
+            try:
+                self.selector.unregister(self.client_sock)
+            except Exception as e:
+                print(f"Error unregistering client socket (it was probably already unregistered/not registered). Continuing socket shutdown. Error: {e}")
             self.client_sock.shutdown(SHUT_RDWR)
             self.client_sock.close()
 
-    def close(self):
+    def __close(self):
         log("closing everything...")
         # https://docs.python.org/3/howto/sockets.html#disconnecting
         self.exit_event.set()
@@ -134,45 +205,51 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
 
         if self.select_task is not None:
             self.select_task.cancel()
-        # if self.sync_message_sending_task is not None:
-        #     self.sync_message_sending_task.cancel()
         if self.other_work_task is not None:
             self.other_work_task.cancel()
+        
+        if self.wait_for_empty_buffers_to_close_client_socket_task is not None:
+            self.wait_for_empty_buffers_to_close_client_socket_task.cancel()
 
-        if self.client_sock is not None:
-            try:
-                self.selector.unregister(self.client_sock)
-            except Exception as e:
-                print(f"error unregistering client socket (it was probably already unregistered/not registered). Error: {e}")
-            self.client_sock.shutdown(SHUT_RDWR)
-            self.client_sock.close()
+        self._disconnect_client()
 
     async def start(self):
         log("starting server and other work task.")
-        self.select_task = asyncio.create_task(self.select_loop(), name="EBF5AP socket select loop ")
+        self.select_task = asyncio.create_task(self.select_loop(), name="EBF5AP socket select loop")
         self.other_work_task = asyncio.create_task(self.other_work(), name="EBF5AP asyncio test other work")
 
         await self.exit_event.wait()
 
     async def select_loop(self):
-        while True:
-            events = self.selector.select(timeout=0)
-            for selector_key, mask in events:
-                # It doesn't very clear from this code but this callback comes from the data parameter of
-                # self.selector.register(<whatever>, <whatever>, data=callback_function_in_our_case).
-                # This is a kinda clever design but it's also confusing until you know that's what it is doing.
-                # I don't know why the library was made like this but whatever sure fine I guess.
-                # I'll just do it like this with this comment explaining it because it is admittedly convenient.
-                callback = selector_key.data
-                if callable(callback):
-                    callback(selector_key.fileobj, mask)
-            
-            await asyncio.sleep(0)
+        try:
+            while True:
+                events = self.selector.select(timeout=0)
+                for selector_key, mask in events:
+                    # It doesn't very clear from this code but this callback comes from the data parameter of
+                    # self.selector.register(<whatever>, <whatever>, data=callback_function_in_our_case).
+                    # This is a kinda clever design but it's also confusing until you know that's what it is doing.
+                    # I don't know why the library was made like this but whatever sure fine I guess.
+                    # I'll just do it like this with this comment explaining it because it is admittedly convenient.
+
+                    # maybe this callback should be wrapped in a try except?
+                    callback = selector_key.data
+                    if callable(callback):
+                        if iscoroutinefunction(callback):
+                            await callback(selector_key.fileobj, mask)
+                        else:
+                            callback(selector_key.fileobj, mask)
+                        
+                await asyncio.sleep(1/30) # 1 EBF5 frame
+        except KeyboardInterrupt:
+            self.__close()
+        finally:
+            # I would add a "WARNING: " to this message but if we're just doing a normal self.__close() this message will also come up.
+            log("select_loop() threw an error, client socket will not send or receive unless select_loop() is recreated in a new task.")
 
     async def other_work(self):
         while True:
-            log("other work (+ sleep)... ")
-            await asyncio.sleep(3) # ALSO TRY THIS WITH A REALLY LONG SLEEP DURATION
+            log("print from a task that'd be doing something else (+ sleep)... ")
+            await asyncio.sleep(0.1)
 
 
 serverTest = TestAsyncCommunicationAndOtherWorkAtTheSameTime("localhost", 4999)

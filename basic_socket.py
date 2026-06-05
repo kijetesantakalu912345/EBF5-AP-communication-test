@@ -94,7 +94,7 @@ class BasicSocket:
         :raises SocketConnectionBrokenError: socket connection is broken/interrupted while writing the message
         """
         data = msg.encode("utf-8")
-        header = len(data).to_bytes(HEADER_SIZE, "big", signed=False)
+        header = len(data).to_bytes(HEADER_SIZE, "big", signed=False) # FIXME: this probably doesn't handle unicode properly!!!!
         self._send_all(header)
         self._send_all(data)
 
