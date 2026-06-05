@@ -4,6 +4,7 @@ import selectors
 from datetime import datetime
 import json
 from inspect import iscoroutinefunction
+from traceback import print_tb
 
 HOST = "localhost"
 PORT = 4999
@@ -74,8 +75,8 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
             return False
 
         log(f"adding to send queue: {UTF8_message}")
-        length_bytes = len(UTF8_message).to_bytes(4, "big", signed=False) # WAIT THIS WOULDN'T HANDLE UNICODE PROPERLY
         message_bytes = UTF8_message.encode("utf-8")
+        length_bytes = len(message_bytes).to_bytes(4, "big", signed=False)
         self.message_bytes_to_send += length_bytes
         self.message_bytes_to_send += message_bytes
         return True
@@ -92,7 +93,7 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
 
     async def client_readwrite_callback(self, client: Socket, mask):
         #log(f"mask: {mask} | read: {mask & selectors.EVENT_READ} | write: {mask & selectors.EVENT_WRITE} | read: {selectors.EVENT_READ} | write: {selectors.EVENT_WRITE}")
-        if mask & selectors.EVENT_READ:
+        if mask & selectors.EVENT_READ and self.does_client_socket_exist():
             log("reading...")
 
             new_bytes = client.recv(2 ** 16)
@@ -102,7 +103,7 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
             if len(new_bytes) == 0:
                 log("DISCONNECT RECEIVED!")
                 self._disconnect_client()
-                raise SocketConnectionBrokenError
+                #raise SocketConnectionBrokenError
             
             #log(f"start: {self.received_message_bytes}")
             #log(f"len(new_bytes): {len(new_bytes)}")
@@ -130,8 +131,11 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
                 # doing it here saves an extra loop.
                 if self.is_waiting_for_new_message and len(self.received_message_bytes) < 4:
                     done_reading = True
-            
-        if mask & selectors.EVENT_WRITE:
+        
+        elif not self.does_client_socket_exist():
+            log("skipping reading because the client socket apparently doesn't exist.")
+
+        if mask & selectors.EVENT_WRITE and self.does_client_socket_exist():
             if len(self.message_bytes_to_send) > 0:
                 log("writing...")
                 log(f"len(self.message_bytes_to_send): {len(self.message_bytes_to_send)}")
@@ -140,12 +144,18 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
                 log(f"bytes_sent: {bytes_sent}, len(self.message_bytes_to_send): {len(self.message_bytes_to_send)}")
             else:
                 log("socket is writable but we have nothing to send right now.")
+        
+        elif not self.does_client_socket_exist():
+            log("skipping writing because the client socket apparently doesn't exist.")
 
     def on_message_received(self, message: str):
         log(f"received message: \"{message}\"")
         reply = "message received successfully in a callback called from an asyncio `Task` polling the socket with `select()`!"
         self.add_UTF8_message_to_send_queue(json.dumps({"type":"client_to_game_debug_message", "text":reply}))
-        #self.__close()
+        self.add_UTF8_message_to_send_queue(json.dumps({"type":"client_to_game_debug_message",
+                "text":"also unicode test: here's an emdash — mid message, emdash at the end of the message—"}))
+        self.add_UTF8_message_to_send_queue(json.dumps({"type":"client_to_game_debug_message",
+                "text":"more random unicode characters: pi: π, smiley: 😀, pirate flag: 🏴‍☠️, all of them next to each other: π😀🏴‍☠️—"}))
         self.schedule_client_disconnect()
 
     def schedule_client_disconnect(self):
@@ -170,23 +180,23 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
             if waited_seconds > max_wait_seconds:
                 log(f"WARNING: A client socket disconnect was scheduled but the buffers didn't clear after waiting a timeout of {max_wait_seconds}, " +
                     "so we're force closing the socket right now anyway.")
+                log(f"self.message_bytes_to_send: {self.message_bytes_to_send} | self.received_message_bytes: {self.received_message_bytes}")
                 log(f"len(self.message_bytes_to_send): {len(self.message_bytes_to_send)} | len(self.received_message_bytes): {len(self.received_message_bytes)}")
                 log("(there should be nothing to send but there probably is something to read if the game is sending too many messages to us)")
                 break
         
         log("Client socket will be disconnected now and buffers will be cleared.")
+        self._disconnect_client()
+
+    def _clear_buffers(self):
         self.message_bytes_to_send.clear()
         self.received_message_bytes.clear()
         self.incoming_message_final_length = 0
-        if self.does_client_socket_exist():
-            self._disconnect_client()
-        else:
-            log("Client socket disconnected early or the client socket was closed/didn't exist already.")
-            # should I try to unregister if we can here?
-
 
     def _disconnect_client(self):
-        log("closing client...")
+        """Try to use `schedule_client_disconnect()` instead of directly calling `_disconnect_client()`."""
+        log("closing client and clearing buffers...")
+        self._clear_buffers()
         if isinstance(self.client_sock, Socket):
             try:
                 self.selector.unregister(self.client_sock)
@@ -197,7 +207,8 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
 
     def __close(self):
         log("closing everything...")
-        # https://docs.python.org/3/howto/sockets.html#disconnecting
+        self._clear_buffers()
+
         self.exit_event.set()
         self.selector.unregister(self.server_sock)
         self.server_sock.shutdown(SHUT_RDWR)
@@ -212,13 +223,6 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
             self.wait_for_empty_buffers_to_close_client_socket_task.cancel()
 
         self._disconnect_client()
-
-    async def start(self):
-        log("starting server and other work task.")
-        self.select_task = asyncio.create_task(self.select_loop(), name="EBF5AP socket select loop")
-        self.other_work_task = asyncio.create_task(self.other_work(), name="EBF5AP asyncio test other work")
-
-        await self.exit_event.wait()
 
     async def select_loop(self):
         try:
@@ -241,15 +245,26 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
                         
                 await asyncio.sleep(1/30) # 1 EBF5 frame
         except KeyboardInterrupt:
+            log("received `KeyboardInterrupt`, closing everything...")
             self.__close()
-        finally:
+        except Exception as e:
             # I would add a "WARNING: " to this message but if we're just doing a normal self.__close() this message will also come up.
-            log("select_loop() threw an error, client socket will not send or receive unless select_loop() is recreated in a new task.")
+            log("select_loop() threw an error, client socket will not send or receive unless select_loop() is recreated in a new task. Error:\n" + str(e))
+            print_tb(e.__traceback__)
+        finally:
+            log("select_loop() exited, socket will no longer send/receive if still alive.")
 
     async def other_work(self):
         while True:
             log("print from a task that'd be doing something else (+ sleep)... ")
             await asyncio.sleep(0.1)
+
+    async def start(self):
+        log("starting server and other work task.")
+        self.select_task = asyncio.create_task(self.select_loop(), name="EBF5AP socket select loop")
+        self.other_work_task = asyncio.create_task(self.other_work(), name="EBF5AP asyncio test other work")
+
+        await self.exit_event.wait()
 
 
 serverTest = TestAsyncCommunicationAndOtherWorkAtTheSameTime("localhost", 4999)
