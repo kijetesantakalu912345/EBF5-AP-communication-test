@@ -24,13 +24,15 @@ def log(message: str):
     print(f"[{now.isoformat(' ')}] {message}")
 
 # https://docs.python.org/3/library/selectors.html#examples
-class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
+class EBF5AsyncioSocket:
     def __init__(self, host: str, port: int, timeouts_seconds: float = 30):
         # Supporting IPV6 would probably be nice.
         # But it'll probably just be running on localhost or a local network with IPV4 LAN addresses anyway.
         self.server_sock: Socket = Socket(AF_INET, SOCK_STREAM)
         
-        # FIXME: this should probably be removed when we aren't just debug testing stuff.
+        # maybe FIXME: this should probably(?) be removed when we aren't just debug testing stuff.
+        # Ehhh. Coming back to it now, I think it's fine.
+        # Maybe I'll remove it for release or if the address isn't localhost or something.
         self.server_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
 
         self.server_sock.bind((host, port))
@@ -83,7 +85,10 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
 
     def accept_connection_callback(self, sock: Socket, mask):
         if self.does_client_socket_exist():
-            log("client attempted to connect before the previous client socket connection was broken, ignoring.")
+            log("client attempted to connect before the previous client socket connection was broken, (effectively) rejecting...")
+            instant_disconnecting_socket, _ = sock.accept()
+            instant_disconnecting_socket.shutdown(SHUT_RDWR)
+            instant_disconnecting_socket.close()
             return
         self.disconnect_scheduled = False
         self.client_sock, address = sock.accept()
@@ -142,8 +147,6 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
                 bytes_sent = client.send(self.message_bytes_to_send)
                 self.message_bytes_to_send = self.message_bytes_to_send[bytes_sent:]
                 log(f"bytes_sent: {bytes_sent}, len(self.message_bytes_to_send): {len(self.message_bytes_to_send)}")
-            else:
-                log("socket is writable but we have nothing to send right now.")
         
         elif not self.does_client_socket_exist():
             log("skipping writing because the client socket apparently doesn't exist.")
@@ -156,7 +159,7 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
                 "text":"also unicode test: here's an emdash — mid message, emdash at the end of the message—"}))
         self.add_UTF8_message_to_send_queue(json.dumps({"type":"client_to_game_debug_message",
                 "text":"more random unicode characters: pi: π, smiley: 😀, pirate flag: 🏴‍☠️, all of them next to each other: π😀🏴‍☠️—"}))
-        self.schedule_client_disconnect()
+        #self.schedule_client_disconnect()
 
     def schedule_client_disconnect(self):
         log("Client disconnect is being scheduled.")
@@ -269,5 +272,5 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
         await self.exit_event.wait()
 
 
-serverTest = TestAsyncCommunicationAndOtherWorkAtTheSameTime("localhost", 4999)
+serverTest = EBF5AsyncioSocket("localhost", 4999)
 asyncio.run(serverTest.start())
