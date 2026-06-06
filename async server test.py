@@ -86,7 +86,7 @@ class EBF5AsyncSocket:
         if mask & selectors.EVENT_READ and self.does_client_socket_exist():
             log("reading...")
 
-            new_bytes = client.recv(2 ** 16)
+            new_bytes = client.recv((2 ** 16)-1)
             self.received_message_bytes += new_bytes
             done_reading = False
 
