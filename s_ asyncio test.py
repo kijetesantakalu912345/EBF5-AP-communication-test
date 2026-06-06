@@ -244,9 +244,11 @@ class TestAsyncCommunicationAndOtherWorkAtTheSameTime:
                             callback(selector_key.fileobj, mask)
                         
                 await asyncio.sleep(1/30) # 1 EBF5 frame
-        except KeyboardInterrupt:
-            log("received `KeyboardInterrupt`, closing everything...")
+        except asyncio.CancelledError: # we can't catch KeyboardInterrupt because asyncio eats it before we receive it (and to be fair this is better anyway)
+            log("select_loop() received `asyncio.CancelledError`, closing everything...")
             self.__close()
+            log("re-raising CancelledError...")
+            raise asyncio.CancelledError
         except Exception as e:
             # I would add a "WARNING: " to this message but if we're just doing a normal self.__close() this message will also come up.
             log("select_loop() threw an error, client socket will not send or receive unless select_loop() is recreated in a new task. Error:\n" + str(e))
