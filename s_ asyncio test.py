@@ -4,34 +4,20 @@ import selectors
 from datetime import datetime
 import json
 from inspect import iscoroutinefunction
-from traceback import print_tb
 
-HOST = "localhost"
-PORT = 4999
-# I HAVE MADE UP MY MIND: I'm gonna try doing it with select() in an asyncio task.
-# I would do it the way archipelago does it but archipelago's way only sends messages in order due to an
-# implementation detail with create_task().
-# Apparently for archipelago the order that messages are sent in doesn't matter so it's fine.
-# Personally I don't really want to rely on that assumption.
-# So I'm doing it differently.
-
-class SocketConnectionBrokenError(RuntimeError):
-    def __init__(self, *args):
-        super().__init__("socket connection broken", *args)
 
 def log(message: str):
     now = datetime.now()
     print(f"[{now.isoformat(' ')}] {message}")
 
-# https://docs.python.org/3/library/selectors.html#examples
-class EBF5AsyncioSocket:
+
+class EBF5AsyncSocket:
     def __init__(self, host: str, port: int, timeouts_seconds: float = 30):
         # Supporting IPV6 would probably be nice.
         # But it'll probably just be running on localhost or a local network with IPV4 LAN addresses anyway.
         self.server_sock: Socket = Socket(AF_INET, SOCK_STREAM)
         
         # maybe FIXME: this should probably(?) be removed when we aren't just debug testing stuff.
-        # Ehhh. Coming back to it now, I think it's fine.
         # Maybe I'll remove it for release or if the address isn't localhost or something.
         self.server_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
 
@@ -56,7 +42,6 @@ class EBF5AsyncioSocket:
 
         self.disconnect_scheduled = False
 
-        # No this isn't grammatically incorrect, I'm talking about *all* of our socket related timeouts, in seconds, all using this same singular value.
         self.timeouts_seconds = timeouts_seconds
 
         if timeouts_seconds >= 0:
@@ -85,7 +70,7 @@ class EBF5AsyncioSocket:
 
     def accept_connection_callback(self, sock: Socket, mask):
         if self.does_client_socket_exist():
-            log("client attempted to connect before the previous client socket connection was broken, (effectively) rejecting...")
+            log("something attempted to connect while the previous client socket connection is still alive, (effectively) rejecting...")
             instant_disconnecting_socket, _ = sock.accept()
             instant_disconnecting_socket.shutdown(SHUT_RDWR)
             instant_disconnecting_socket.close()
@@ -108,7 +93,6 @@ class EBF5AsyncioSocket:
             if len(new_bytes) == 0:
                 log("DISCONNECT RECEIVED!")
                 self._disconnect_client()
-                #raise SocketConnectionBrokenError
             
             #log(f"start: {self.received_message_bytes}")
             #log(f"len(new_bytes): {len(new_bytes)}")
@@ -126,12 +110,11 @@ class EBF5AsyncioSocket:
                         message_text: str = self.received_message_bytes[4:4 + self.incoming_message_final_length].decode("utf-8")
                         self.on_message_received(message_text)
 
-                        #self.received_message_bytes.clear()
                         self.received_message_bytes = self.received_message_bytes[4 + self.incoming_message_final_length:]
                         self.incoming_message_final_length = 0
                         self.is_waiting_for_new_message = True
                 
-                #await asyncio.sleep(0)
+                await asyncio.sleep(0)
                 
                 # doing it here saves an extra loop.
                 if self.is_waiting_for_new_message and len(self.received_message_bytes) < 4:
@@ -159,7 +142,7 @@ class EBF5AsyncioSocket:
                 "text":"also unicode test: here's an emdash — mid message, emdash at the end of the message—"}))
         self.add_UTF8_message_to_send_queue(json.dumps({"type":"client_to_game_debug_message",
                 "text":"more random unicode characters: pi: π, smiley: 😀, pirate flag: 🏴‍☠️, all of them next to each other: π😀🏴‍☠️—"}))
-        #self.schedule_client_disconnect()
+        self.schedule_client_disconnect()
 
     def schedule_client_disconnect(self):
         log("Client disconnect is being scheduled.")
@@ -183,36 +166,41 @@ class EBF5AsyncioSocket:
             if waited_seconds > max_wait_seconds:
                 log(f"WARNING: A client socket disconnect was scheduled but the buffers didn't clear after waiting a timeout of {max_wait_seconds}, " +
                     "so we're force closing the socket right now anyway.")
-                log(f"self.message_bytes_to_send: {self.message_bytes_to_send} | self.received_message_bytes: {self.received_message_bytes}")
+                #log(f"self.message_bytes_to_send: {self.message_bytes_to_send} | self.received_message_bytes: {self.received_message_bytes}")
                 log(f"len(self.message_bytes_to_send): {len(self.message_bytes_to_send)} | len(self.received_message_bytes): {len(self.received_message_bytes)}")
                 log("(there should be nothing to send but there probably is something to read if the game is sending too many messages to us)")
                 break
         
-        log("Client socket will be disconnected now and buffers will be cleared.")
         self._disconnect_client()
 
     def _clear_buffers(self):
+        log("clearing buffers.")
         self.message_bytes_to_send.clear()
         self.received_message_bytes.clear()
         self.incoming_message_final_length = 0
 
     def _disconnect_client(self):
-        """Try to use `schedule_client_disconnect()` instead of directly calling `_disconnect_client()`."""
-        log("closing client and clearing buffers...")
+        """Clears the read/write buffers and closes the client socket if it currently exists.
+        
+        Use `schedule_client_disconnect()` instead of directly calling `_disconnect_client()` when sending messages.
+        """
         self._clear_buffers()
-        if isinstance(self.client_sock, Socket):
-            try:
-                self.selector.unregister(self.client_sock)
-            except Exception as e:
-                print(f"Error unregistering client socket (it was probably already unregistered/not registered). Continuing socket shutdown. Error: {e}")
+        if self.does_client_socket_exist():
+            log("closing client.")
+            self.selector.unregister(self.client_sock)
             self.client_sock.shutdown(SHUT_RDWR)
             self.client_sock.close()
+        else:
+            log("client was already closed.")
 
     def __close(self):
         log("closing everything...")
-        self._clear_buffers()
-
         self.exit_event.set()
+
+        # _disconnect_client() clears the buffers anyway
+        # self._clear_buffers()
+        self._disconnect_client()
+        
         self.selector.unregister(self.server_sock)
         self.server_sock.shutdown(SHUT_RDWR)
         self.server_sock.close()
@@ -224,8 +212,6 @@ class EBF5AsyncioSocket:
         
         if self.wait_for_empty_buffers_to_close_client_socket_task is not None:
             self.wait_for_empty_buffers_to_close_client_socket_task.cancel()
-
-        self._disconnect_client()
 
     async def select_loop(self):
         try:
@@ -246,18 +232,19 @@ class EBF5AsyncioSocket:
                         else:
                             callback(selector_key.fileobj, mask)
                         
-                await asyncio.sleep(1/30) # 1 EBF5 frame
-        except asyncio.CancelledError: # we can't catch KeyboardInterrupt because asyncio eats it before we receive it (and to be fair this is better anyway)
-            log("select_loop() received `asyncio.CancelledError`, closing everything...")
+                await asyncio.sleep(1/30) # 1 EBF5 frame (maybe sleep less than that?)
+        except (Exception, asyncio.CancelledError) as e: # Exception does not include asyncio.CancelledError apparently.
+            if isinstance(e, asyncio.CancelledError):
+                log("select_loop() received `asyncio.CancelledError`, closing everything...")
+            else:
+                log("select_loop() threw an error, closing everything...")
+            
             self.__close()
-            log("re-raising CancelledError...")
-            raise asyncio.CancelledError
-        except Exception as e:
-            # I would add a "WARNING: " to this message but if we're just doing a normal self.__close() this message will also come up.
-            log("select_loop() threw an error, client socket will not send or receive unless select_loop() is recreated in a new task. Error:\n" + str(e))
-            print_tb(e.__traceback__)
+
+            log("re-raising original error.")
+            raise e
         finally:
-            log("select_loop() exited, socket will no longer send/receive if still alive.")
+            log("select_loop() exiting, socket will no longer send/receive if still alive.")
 
     async def other_work(self):
         while True:
@@ -272,5 +259,5 @@ class EBF5AsyncioSocket:
         await self.exit_event.wait()
 
 
-serverTest = EBF5AsyncioSocket("localhost", 4999)
+serverTest = EBF5AsyncSocket("localhost", 4999)
 asyncio.run(serverTest.start())
