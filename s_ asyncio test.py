@@ -232,7 +232,7 @@ class EBF5AsyncioSocket:
             while True:
                 events = self.selector.select(timeout=0)
                 for selector_key, mask in events:
-                    # It doesn't very clear from this code but this callback comes from the data parameter of
+                    # It doesn't look very clear from this code but this callback comes from the data parameter of
                     # self.selector.register(<whatever>, <whatever>, data=callback_function_in_our_case).
                     # This is a kinda clever design but it's also confusing until you know that's what it is doing.
                     # I don't know why the library was made like this but whatever sure fine I guess.
