@@ -1,4 +1,7 @@
+
 from socket import socket as Socket, AF_INET, SOCK_STREAM, SHUT_RDWR
+# import asyncio
+# from asyncio import StreamReader, StreamWriter
 # bytes 1-4 are an unsigned 32 bit length. maybe a bit overkill, but i think it's fine.
 
 HEADER_SIZE = 4  # n bytes for the size (int) of the payload to receive / send
@@ -7,6 +10,26 @@ HEADER_SIZE = 4  # n bytes for the size (int) of the payload to receive / send
 class SocketConnectionBrokenError(RuntimeError):
     def __init__(self, *args):
         super().__init__("socket connection broken", *args)
+
+
+# honestly it might be easier to just not use an extra class in the middle?
+# ehhhh...
+# class BasicAsyncioSocket:
+#     """A basic TCP socket class using asyncio"""
+
+#     def __init__(self, host: str, port: int):
+#         self.host = host
+#         self.port = port
+#         self.reader: StreamReader | None = None
+#         self.writer: StreamWriter | None = None
+
+#     async def __new_connection_callback(self, reader: StreamReader, writer: StreamWriter):
+#         pass
+
+#     async def startup_server(self):
+#         # go set the backlog param!
+#         self.
+
 
 
 class BasicSocket:
@@ -71,7 +94,7 @@ class BasicSocket:
         :raises SocketConnectionBrokenError: socket connection is broken/interrupted while writing the message
         """
         data = msg.encode("utf-8")
-        header = len(data).to_bytes(HEADER_SIZE, "big", signed=False)
+        header = len(data).to_bytes(HEADER_SIZE, "big", signed=False) # FIXME: this probably doesn't handle unicode properly!!!!
         self._send_all(header)
         self._send_all(data)
 
